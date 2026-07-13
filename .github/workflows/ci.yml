@@ -13,6 +13,5 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: stable
-      - run: forge fmt --check
-      - run: forge build
-      - run: forge test -vv
+      - name: Run CI
+        run: bash scripts/ci.sh

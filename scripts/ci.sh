@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
 windows_cwd() {
   if command -v wslpath >/dev/null 2>&1; then
     wslpath -w "${PWD}"
@@ -41,6 +44,7 @@ run_forge() {
   exit 127
 }
 
+bash scripts/bootstrap.sh
 run_forge fmt --check
 run_forge build
 run_forge test -vv
