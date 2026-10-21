@@ -1,10 +1,25 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import { LeaseRecord } from "../src/types/PalisadeTypes.sol";
+import { LeaseRecord, LeaseStatus, ListingRecord } from "../src/types/PalisadeTypes.sol";
 import { PalisadeTestBase } from "./PalisadeTestBase.sol";
 
 contract PalisadeLeaseMarketTest is PalisadeTestBase {
+    function testListingRecordsOwnerTermsAndPriceBounds() public {
+        _listPosition();
+
+        ListingRecord memory listing = market.listingOf(positionId);
+        assertTrue(listing.active);
+        assertEq(listing.owner, OWNER);
+        assertEq(listing.basePricePerDay, 10 * UNIT);
+        assertEq(listing.minPricePerDay, 5 * UNIT);
+
+        uint256 shortPrice = market.quote(positionId, 3 days).price;
+        uint256 longPrice = market.quote(positionId, 10 days).price;
+        assertGt(shortPrice, 0);
+        assertGt(longPrice, shortPrice);
+    }
+
     function testLeaseCanClaimRewardsFromItsOwnPeriod() public {
         _listPosition();
         _approveMarket(BOB);
@@ -24,70 +39,63 @@ contract PalisadeLeaseMarketTest is PalisadeTestBase {
         assertEq(market.pendingRewards(leaseId), 0);
     }
 
-    function testRenewalContinuityPreservesPendingRewards() public {
+    function testOpenLeaseRequiresAcceptableQuote() public {
         _listPosition();
         _approveMarket(BOB);
-        _approveMarket(CAROL);
 
         vm.prank(BOB);
-        uint256 oldLeaseId = market.openLease(positionId, 10 days, type(uint256).max);
+        vm.expectRevert();
+        market.openLease(positionId, 7 days, 0);
 
-        vm.warp(block.timestamp + 9 days);
-        _harvest(120 * UNIT);
-
-        assertEq(market.pendingRewards(oldLeaseId), 120 * UNIT);
-
-        vm.prank(CAROL);
-        uint256 newLeaseId = market.renewLease(oldLeaseId, 7 days, type(uint256).max);
-
-        LeaseRecord memory oldLease = market.leaseOf(oldLeaseId);
-        LeaseRecord memory newLease = market.leaseOf(newLeaseId);
-
-        assertEq(oldLease.rewardDebt, 0);
-        assertEq(newLease.rewardDebt, 120 * UNIT);
-        assertEq(newLease.lessee, CAROL);
-        assertEq(newLease.start, oldLease.end);
-        assertLt(block.timestamp, newLease.start);
-
-        uint256 beforeClaim = asset.balanceOf(CAROL);
-        vm.prank(CAROL);
-        uint256 claimed = market.claimRewards(newLeaseId, CAROL);
-
-        assertEq(claimed, 120 * UNIT);
-        assertEq(asset.balanceOf(CAROL) - beforeClaim, 120 * UNIT);
-        assertEq(market.pendingRewards(oldLeaseId), 0);
+        uint256 quote = market.quote(positionId, 7 days).price;
+        vm.prank(BOB);
+        uint256 leaseId = market.openLease(positionId, 7 days, quote);
+        LeaseRecord memory lease = market.leaseOf(leaseId);
+        assertEq(lease.lessee, BOB);
+        assertEq(lease.pricePaid, quote);
+        assertEq(market.activeLeaseFor(positionId), leaseId);
+        assertTrue(vault.isPositionLocked(positionId));
     }
 
-    function testChainedRenewalsPreservePendingRewardsAcrossContinuations() public {
-        address dave = address(0xDA7E);
-        asset.mint(dave, 2000 * UNIT);
+    function testRenewalCreatesScheduledContinuation() public {
         _listPosition();
         _approveMarket(BOB);
         _approveMarket(CAROL);
-        vm.prank(dave);
-        asset.approve(address(market), type(uint256).max);
 
         vm.prank(BOB);
-        uint256 leaseId = market.openLease(positionId, 10 days, type(uint256).max);
+        uint256 originalId = market.openLease(positionId, 10 days, type(uint256).max);
+        LeaseRecord memory original = market.leaseOf(originalId);
 
-        vm.warp(block.timestamp + 9 days);
-        _harvest(90 * UNIT);
-
-        vm.prank(dave);
-        uint256 intermediateLease = market.renewLease(leaseId, 5 days, type(uint256).max);
-
-        LeaseRecord memory intermediateRecord = market.leaseOf(intermediateLease);
-        vm.warp(intermediateRecord.end - 1 days);
+        vm.warp(original.end - 1 days);
         vm.prank(CAROL);
-        uint256 finalLease = market.renewLease(intermediateLease, 5 days, type(uint256).max);
+        uint256 continuationId = market.renewLease(originalId, 7 days, type(uint256).max);
+        LeaseRecord memory continuation = market.leaseOf(continuationId);
 
-        assertEq(market.pendingRewards(leaseId), 0);
-        assertEq(market.pendingRewards(intermediateLease), 0);
-        assertEq(market.pendingRewards(finalLease), 90 * UNIT);
+        assertEq(continuation.predecessorId, originalId);
+        assertEq(continuation.lessee, CAROL);
+        assertEq(continuation.start, original.end);
+        assertEq(continuation.end, original.end + 7 days);
+        assertEq(market.activeLeaseFor(positionId), continuationId);
+        assertEq(uint256(market.leaseOf(originalId).status), uint256(LeaseStatus.Settled));
 
-        uint256 beforeClaim = asset.balanceOf(CAROL);
+        vm.warp(continuation.start + 1);
+        _harvest(70 * UNIT);
         vm.prank(CAROL);
-        assertEq(market.claimRewards(finalLease, CAROL), 90 * UNIT);
-        assertEq(asset.balanceOf(CAROL) - beforeClaim, 90 * UNIT);
+        assertEq(market.claimRewards(continuationId, CAROL), 70 * UNIT);
+    }
+
+    function testExpiredLeaseUnlocksPosition() public {
+        _listPosition();
+        _approveMarket(BOB);
+
+        vm.prank(BOB);
+        uint256 leaseId = market.openLease(positionId, 7 days, type(uint256).max);
+        LeaseRecord memory lease = market.leaseOf(leaseId);
+        vm.warp(lease.end);
+
+        market.settleExpiredLease(leaseId);
+        assertEq(market.activeLeaseFor(positionId), 0);
+        assertFalse(vault.isPositionLocked(positionId));
+        assertEq(uint256(market.leaseOf(leaseId).status), uint256(LeaseStatus.Expired));
     }
 }

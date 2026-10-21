@@ -1,0 +1,10 @@
+{
+  "editor.formatOnSave": true,
+  "files.eol": "\n",
+  "files.exclude": {
+    "**/out": true,
+    "**/cache": true,
+    "**/lib": true
+  },
+  "solidity.formatter": "forge"
+}
